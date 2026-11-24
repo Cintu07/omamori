@@ -2,7 +2,7 @@
 
 omamori is a content blocker written in Rust, with no dependencies. It reads the filter lists uBlock Origin reads and tells you whether a request should load. It is the blocker inside [kamaitachi](https://github.com/Cintu07/kamaitachi), split out so anything else can use it.
 
-I measured it on a Windows laptop in November 2026. EasyList plus EasyPrivacy is 107,004 network rules and another 23,803 that hide elements, and omamori reads all of it in 38 ms into 3.77 MB. kamaitachi loads eight lists, which is about 300,000 rules with 158,036 malware entries among them. That takes 7.26 MB, and a request is checked in about 4.5 microseconds.
+I measured it on a Windows laptop in November 2026. EasyList plus EasyPrivacy is 107,004 network rules and another 23,803 that hide elements, and omamori reads all of it in 38 ms into 3.77 MB. kamaitachi loads eight lists, which is about 300,000 rules with 158,036 malware entries among them. That takes 4.85 MB, and a request is checked in about 5 microseconds.
 
 The name comes from the small protective charms sold at Japanese shrines.
 
