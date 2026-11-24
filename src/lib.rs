@@ -104,14 +104,44 @@ struct Pending {
 impl Blocker {
     /// Reads filter lists. Pass each list's text with `true` if it is a malware or
     /// phishing list; pages on those get stopped outright, not only their requests.
+    /// To read a list without holding all of its text at once, use [`Builder`].
     pub fn new(lists: &[(&str, bool)]) -> Blocker {
-        let mut b = Blocker::default();
-        let mut pending: Vec<Pending> = Vec::new();
+        let mut bd = Builder::new();
         for (list, danger) in lists {
-            for line in list.lines() {
-                b.line(line.trim(), &mut pending, *danger);
-            }
+            bd.add(list, *danger);
         }
+        bd.finish()
+    }
+}
+
+/// Builds a [`Blocker`] one line at a time. Feeding it a file line by line keeps the
+/// list text out of memory; only the rules themselves stay.
+#[derive(Default)]
+pub struct Builder {
+    b: Blocker,
+    pending: Vec<Pending>,
+}
+
+impl Builder {
+    pub fn new() -> Builder {
+        Builder::default()
+    }
+
+    /// Adds every line of a list.
+    pub fn add(&mut self, text: &str, danger: bool) {
+        for line in text.lines() {
+            self.line(line, danger);
+        }
+    }
+
+    /// Adds one line of a list. `danger` marks a malware or phishing list.
+    pub fn line(&mut self, line: &str, danger: bool) {
+        self.b.line(line.trim(), &mut self.pending, danger);
+    }
+
+    /// Picks each rule's word and hands back the finished blocker.
+    pub fn finish(self) -> Blocker {
+        let Builder { mut b, pending } = self;
         b.danger_count = b.danger_hosts.len() + pending.iter().filter(|p| p.f.flags & DANGER != 0).count();
         b.danger_count += b.danger_paths.len();
         b.danger_hosts.sort_unstable();
@@ -148,6 +178,9 @@ impl Blocker {
         b.counts.0 = b.hosts.len() + b.filters.len();
         b
     }
+}
+
+impl Blocker {
 
     /// Should this request be stopped? `page` is the host of the page that made it,
     /// which decides third-party rules and `$domain=` options.
