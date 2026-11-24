@@ -1,0 +1,11 @@
+[package]
+name = "omamori"
+version = "0.1.0"
+edition = "2024"
+description = "A small, fast content blocker that reads uBlock Origin's filter lists"
+license = "MIT"
+repository = "https://github.com/Cintu07/omamori"
+keywords = ["adblock", "content-blocker", "easylist", "privacy"]
+categories = ["web-programming"]
+
+[dependencies]
