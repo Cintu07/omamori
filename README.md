@@ -18,7 +18,8 @@ let b = Blocker::new(&[(&easylist, false), (&urlhaus, true)]);
 
 b.blocks("https://securepubads.g.doubleclick.net/gampad/ads", "news.com", Kind::Script); // true
 b.danger("https://some-phishing-site.example/login"); // true if a list has it
-let (every_site, this_site) = b.hiding("news.com"); // css that hides ad boxes
+let every_site = b.generic_hiding(); // css that hides ad boxes, the same on every page
+let this_site = b.site_hiding("news.com"); // and the rules for one site
 ```
 
 There is a small tool in `examples/` that loads lists from disk and checks one url.

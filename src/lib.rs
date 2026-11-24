@@ -13,9 +13,10 @@
 //!
 //! ```
 //! use omamori::{Blocker, Kind};
-//! let b = Blocker::new(&[("||ads.example.com^\n##.banner-ad\n", false)]);
+//! let b = Blocker::new(&[("||ads.example.com^\nnews.com##.banner-ad\n", false)]);
 //! assert!(b.blocks("https://ads.example.com/x.js", "news.com", Kind::Script));
 //! assert!(!b.blocks("https://news.com/app.js", "news.com", Kind::Script));
+//! assert!(b.site_hiding("news.com").contains(".banner-ad"));
 //! ```
 
 use std::collections::HashMap;
@@ -78,15 +79,18 @@ pub struct Blocker {
     pub(crate) hosts: Vec<u64>,
     pub(crate) filters: Vec<Filter>,
     pub(crate) text: String,
-    pub(crate) index: HashMap<u64, Vec<u32>>,
+    /// (word, rule) pairs sorted by word. One array instead of a map of small lists:
+    /// thousands of tiny allocations cost more than the rules they held
+    pub(crate) index: Vec<(u64, u32)>,
     pub(crate) loose: Vec<u32>,
     pub(crate) doms: Vec<(u64, bool)>,
     /// pages where a list turns blocking off (`@@||site^$document`)
     pub(crate) page_ok: Vec<u64>,
     pub(crate) sel_text: String,
     pub(crate) generic: Vec<(u32, u32)>,
-    pub(crate) by_host: HashMap<u64, Vec<(u32, u32)>>,
-    pub(crate) unhide: HashMap<u64, Vec<(u32, u32)>>,
+    /// (host, selector start, selector length), sorted by host
+    pub(crate) by_host: Vec<(u64, u32, u32)>,
+    pub(crate) unhide: Vec<(u64, u32, u32)>,
     /// hosts on malware and phishing lists
     pub(crate) danger_hosts: Vec<u64>,
     /// exact malware links (host + path), as hashes
@@ -94,11 +98,6 @@ pub struct Blocker {
     /// how many rules loaded: (network rules, element-hiding rules)
     pub counts: (usize, usize),
     pub danger_count: usize,
-}
-
-struct Pending {
-    pub(crate) pat: String,
-    f: Filter,
 }
 
 impl Blocker {
@@ -119,7 +118,6 @@ impl Blocker {
 #[derive(Default)]
 pub struct Builder {
     b: Blocker,
-    pending: Vec<Pending>,
 }
 
 impl Builder {
@@ -136,14 +134,13 @@ impl Builder {
 
     /// Adds one line of a list. `danger` marks a malware or phishing list.
     pub fn line(&mut self, line: &str, danger: bool) {
-        self.b.line(line.trim(), &mut self.pending, danger);
+        self.b.line(line.trim(), danger);
     }
 
     /// Picks each rule's word and hands back the finished blocker.
     pub fn finish(self) -> Blocker {
-        let Builder { mut b, pending } = self;
-        b.danger_count = b.danger_hosts.len() + pending.iter().filter(|p| p.f.flags & DANGER != 0).count();
-        b.danger_count += b.danger_paths.len();
+        let mut b = self.b;
+        b.danger_count = b.danger_hosts.len() + b.filters.iter().filter(|f| f.flags & DANGER != 0).count() + b.danger_paths.len();
         b.danger_hosts.sort_unstable();
         b.danger_hosts.dedup();
         b.danger_paths.sort_unstable();
@@ -151,24 +148,30 @@ impl Builder {
         // count how often each word shows up across all rules, then file every rule
         // under its rarest one. common words like "com" would make huge buckets
         let mut freq: HashMap<u64, u32> = HashMap::new();
-        let toks: Vec<Vec<u64>> = pending.iter().map(|p| tokens_of(&p.pat, p.f.flags)).collect();
-        for t in &toks {
-            for h in t {
-                *freq.entry(*h).or_default() += 1;
+        for f in &b.filters {
+            for h in tokens_of(b.pattern(f), f.flags) {
+                *freq.entry(h).or_default() += 1;
             }
         }
-        for (p, t) in pending.into_iter().zip(toks) {
-            let i = b.filters.len() as u32;
-            let mut f = p.f;
-            f.pat = b.text.len() as u32;
-            f.len = p.pat.len().min(u16::MAX as usize) as u16;
-            b.text.push_str(&p.pat);
-            b.filters.push(f);
-            match t.iter().min_by_key(|h| freq.get(h).copied().unwrap_or(0)) {
-                Some(h) => b.index.entry(*h).or_default().push(i),
-                None => b.loose.push(i),
+        let mut index = Vec::with_capacity(b.filters.len());
+        let mut loose = Vec::new();
+        for (i, f) in b.filters.iter().enumerate() {
+            match tokens_of(b.pattern(f), f.flags).into_iter().min_by_key(|h| freq.get(h).copied().unwrap_or(0)) {
+                Some(h) => index.push((h, i as u32)),
+                None => loose.push(i as u32),
             }
         }
+        index.sort_unstable();
+        b.index = index;
+        b.loose = loose;
+        b.by_host.sort_unstable_by_key(|e| e.0);
+        b.unhide.sort_unstable_by_key(|e| e.0);
+        b.by_host.shrink_to_fit();
+        b.unhide.shrink_to_fit();
+        b.generic.shrink_to_fit();
+        b.danger_hosts.shrink_to_fit();
+        b.danger_paths.shrink_to_fit();
+        b.doms.shrink_to_fit();
         b.hosts.sort_unstable();
         b.hosts.dedup();
         b.page_ok.sort_unstable();
@@ -243,10 +246,8 @@ impl Blocker {
                 while i < b.len() && tok_char(b[i]) {
                     i += 1;
                 }
-                if let Some(list) = self.index.get(&fnv(&b[st..i])) {
-                    for &k in list {
-                        check(k);
-                    }
+                for k in self.bucket(fnv(&b[st..i])) {
+                    check(k);
                 }
             } else {
                 i += 1;
@@ -256,6 +257,16 @@ impl Blocker {
             check(k);
         }
         hit && (important || !exception)
+    }
+
+    /// The rules filed under one word.
+    fn bucket(&self, word: u64) -> impl Iterator<Item = u32> + '_ {
+        let lo = self.index.partition_point(|e| e.0 < word);
+        self.index[lo..].iter().take_while(move |e| e.0 == word).map(|e| e.1)
+    }
+
+    pub(crate) fn pattern(&self, f: &Filter) -> &str {
+        &self.text[f.pat as usize..f.pat as usize + f.len as usize]
     }
 
     fn danger_path(&self, lower: &str, hs: usize) -> bool {
@@ -304,12 +315,10 @@ impl Blocker {
                 while i < b.len() && tok_char(b[i]) {
                     i += 1;
                 }
-                if let Some(list) = self.index.get(&fnv(&b[st..i])) {
-                    for &k in list {
-                        let f = &self.filters[k as usize];
-                        if f.flags & DANGER != 0 && matches(&self.text.as_bytes()[f.pat as usize..f.pat as usize + f.len as usize], f.flags, b, hs, he) {
-                            return true;
-                        }
+                for k in self.bucket(fnv(&b[st..i])) {
+                    let f = &self.filters[k as usize];
+                    if f.flags & DANGER != 0 && matches(self.pattern(f).as_bytes(), f.flags, b, hs, he) {
+                        return true;
                     }
                 }
             } else {
@@ -347,11 +356,11 @@ impl Blocker {
         !any_pos || pos_hit
     }
 
-    /// CSS that hides ad boxes on a page, as (rules for every site, rules for this one).
-    /// The first part is the same everywhere, so a browser can parse it once.
-    pub fn hiding(&self, page: &str) -> (String, String) {
+    /// CSS that hides ad boxes on every site. It never changes for a given blocker,
+    /// so build it once and share it.
+    pub fn generic_hiding(&self) -> String {
         // a selector that starts with an attribute gets tested on every element of every
-        // page. the generic set keeps the ones that start with a tag, class or id
+        // page. this keeps the ones that start with a tag, class or id
         let keyed: Vec<(u32, u32)> = self
             .generic
             .iter()
@@ -361,24 +370,31 @@ impl Blocker {
                 !sel.starts_with('[') && !sel.starts_with(':') && !sel.starts_with('*')
             })
             .collect();
-        let generic_css = self.css(&keyed, &[]);
+        self.css(&keyed, &[])
+    }
+
+    /// CSS that hides ad boxes on this one site, minus anything the lists unhide there.
+    pub fn site_hiding(&self, page: &str) -> String {
         let mut spec = Vec::new();
         let mut unhide = Vec::new();
         let mut h = page;
         loop {
             let k = fnv(h.as_bytes());
-            if let Some(v) = self.by_host.get(&k) {
-                spec.extend(v.iter().copied());
-            }
-            if let Some(v) = self.unhide.get(&k) {
-                unhide.extend(v.iter().copied());
+            for table in [&self.by_host, &self.unhide] {
+                let lo = table.partition_point(|e| e.0 < k);
+                let found = table[lo..].iter().take_while(|e| e.0 == k).map(|e| (e.1, e.2));
+                if std::ptr::eq(table, &self.by_host) {
+                    spec.extend(found);
+                } else {
+                    unhide.extend(found);
+                }
             }
             match h.find('.') {
                 Some(p) => h = &h[p + 1..],
                 None => break,
             }
         }
-        (generic_css, self.css(&spec, &unhide))
+        self.css(&spec, &unhide)
     }
 
     fn css(&self, sels: &[(u32, u32)], except: &[(u32, u32)]) -> String {
@@ -408,15 +424,15 @@ impl Blocker {
         self.hosts.capacity() * 8
             + self.filters.capacity() * std::mem::size_of::<Filter>()
             + self.text.capacity()
-            + self.index.len() * 48
-            + self.index.values().map(|v| v.capacity() * 4).sum::<usize>()
+            + self.index.capacity() * 16
+            + self.loose.capacity() * 4
             + self.doms.capacity() * 16
             + self.danger_hosts.capacity() * 8
             + self.danger_paths.capacity() * 8
             + self.sel_text.capacity()
             + self.generic.capacity() * 8
-            + self.by_host.len() * 48
-            + self.by_host.values().map(|v| v.capacity() * 8).sum::<usize>()
+            + self.by_host.capacity() * 16
+            + self.unhide.capacity() * 16
     }
 }
 

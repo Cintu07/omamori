@@ -28,7 +28,7 @@ fn network_rules() {
 #[test]
 fn hiding_rules() {
     let b = Blocker::new(&[("##.ad\nnews.com##.promo\nnews.com#@#.ad\nexample.com##div:has(.x)\n", false)]);
-    let (g, s) = b.hiding("www.news.com");
+    let (g, s) = (b.generic_hiding(), b.site_hiding("www.news.com"));
     assert!(g.contains(".ad{display:none!important}"), "{g}");
     assert!(s.contains(".promo"));
     assert_eq!(b.counts.1, 3);

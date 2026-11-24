@@ -13,7 +13,7 @@
 use crate::*;
 
 impl Blocker {
-    pub(crate) fn line(&mut self, l: &str, pending: &mut Vec<Pending>, danger: bool) {
+    pub(crate) fn line(&mut self, l: &str, danger: bool) {
         if l.is_empty() || l.starts_with('!') || l.starts_with('[') {
             return;
         }
@@ -36,13 +36,13 @@ impl Blocker {
             let named: Vec<&str> = doms.split(',').map(|d| d.trim()).filter(|d| !d.is_empty() && !d.starts_with('~')).collect();
             if unhide {
                 for d in named {
-                    self.unhide.entry(fnv(d.as_bytes())).or_default().push(r);
+                    self.unhide.push((fnv(d.as_bytes()), r.0, r.1));
                 }
             } else if named.is_empty() {
                 self.generic.push(r);
             } else {
                 for d in named {
-                    self.by_host.entry(fnv(d.as_bytes())).or_default().push(r);
+                    self.by_host.push((fnv(d.as_bytes()), r.0, r.1));
                 }
             }
             self.counts.1 += 1;
@@ -183,7 +183,16 @@ impl Blocker {
             f.flags |= DANGER;
             f.types |= Kind::Document.bit();
         }
-        let pat = if f.flags & CASE != 0 { body.to_string() } else { body.to_ascii_lowercase() };
-        pending.push(Pending { pat, f });
+        // straight into the shared text, lowercased in place, so no rule gets its own string
+        let st = self.text.len();
+        self.text.push_str(body);
+        if f.flags & CASE == 0
+            && let Some(t) = self.text.get_mut(st..)
+        {
+            t.make_ascii_lowercase();
+        }
+        f.pat = st as u32;
+        f.len = body.len().min(u16::MAX as usize) as u16;
+        self.filters.push(f);
     }
 }
